@@ -271,9 +271,13 @@ class SolutionNode(Node):
             self._drive_to(target[0], target[1], 0.22)
             return
 
-        # All known targets are collected; return to the start zone and stop.
-        home_distance = math.hypot(self.x, self.y)
-        if home_distance <= 0.12:
+        # All known targets are collected; return to the safe start zone and brake smoothly.
+        target_hx, target_hy = 0.07, 0.07
+        h_dx = target_hx - self.x
+        h_dy = target_hy - self.y
+        home_distance = math.hypot(h_dx, h_dy)
+
+        if home_distance <= 0.07:
             self._publish_command(0.0, 0.0)
             if abs(self.linear_speed) <= 0.025:
                 now = self.get_clock().now().nanoseconds * 1e-9
@@ -286,7 +290,13 @@ class SolutionNode(Node):
             return
 
         self.home_dwell_start = None
-        self._drive_to(0.0, 0.0, 0.18)
+        h_err = normalize_angle(math.atan2(h_dy, h_dx) - self.yaw)
+        if abs(h_err) > 0.35:
+            self._publish_command(0.0, clamp(1.8 * h_err, -self.max_angular_speed, self.max_angular_speed))
+        else:
+            # Gentle deceleration directly into target_h without wall overshoot
+            h_spd = clamp(0.5 * home_distance, 0.02, 0.10)
+            self._publish_command(h_spd, clamp(1.2 * h_err, -0.8, 0.8))
 
 
 def main() -> None:
