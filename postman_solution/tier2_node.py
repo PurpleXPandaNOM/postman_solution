@@ -1,16 +1,4 @@
-#!/usr/bin/env python3
-"""Standalone Tier 2 solution for the supplied Sim2Real arena.
-
-Uses only public camera, CameraInfo, IMU and noisy wheel-state topics.
-No waypoint-coordinate, evaluator, internal Gazebo, or ground-truth inputs.
-Dependencies: rclpy, numpy, sensor_msgs, geometry_msgs, nav_msgs, tf2_ros.
-Run through the existing tier2_node entry point, or directly:
-  python3 tier2_node.py --ros-args -p use_sim_time:=true
-Start at the initial robot pose; restart this node after resetting the world.
-
-Vision uses NumPy green segmentation and connected components, so cv_bridge
-and OpenCV are not required. Camera geometry matches the supplied arena.sdf.
-"""
+"""Standalone Tier 2 solution for the supplied Sim2Real arena."""
 import itertools
 import math
 import numpy as np
@@ -33,11 +21,6 @@ def clamp(x, lo, hi):
 
 
 def green_components(rgb):
-    """Return (area, mean_u, mean_v, width, height) for green components.
-
-    Row runs plus union-find give 4-connected components without an OpenCV
-    dependency. Pixel coordinates are column u and row v.
-    """
     r, g, b = (rgb[:, :, i].astype(np.float32) for i in range(3))
     mask = (g > 45) & (g > 1.45 * r) & (g > 1.25 * b)
     parents, runs = [], []
@@ -88,19 +71,9 @@ def green_components(rgb):
 
 
 def detect_axis_zeroes(rgb):
-    """Find the floor axes' zero-coordinate pixels from their colors.
-
-    The supplied world draws a red world-X axis at world y=0 and a thin green
-    world-Y axis at world x=0. These visible public image features determine
-    image-axis direction and intercept; this avoids guessing camera image
-    orientation from RViz/ROS optical-frame conventions.
-    """
     r, g, b = (rgb[:, :, i].astype(np.int16) for i in range(3))
     red = (r > 45) & (r > 1.5 * g) & (r > 1.5 * b)
     green = (g > 45) & (g > 1.45 * r) & (g > 1.25 * b)
-    # The red x-axis runs vertically in this overhead image: its strongest
-    # column is the pixel intercept for world y=0. Likewise the green y-axis
-    # runs horizontally: its strongest row is the intercept for world x=0.
     red_columns = red.sum(axis=0)
     green_rows = green.sum(axis=1)
     u0 = int(np.argmax(red_columns))
@@ -112,13 +85,6 @@ def detect_axis_zeroes(rgb):
 
 
 def detect_targets(rgb, intrinsics, camera, pixel_zeroes):
-    """Segment disks, reject floor-axis lines, and project centers to meters.
-
-    Gazebo camera looks along local +X. At pitch +pi/2 and yaw zero, image
-    right points world -Y and image down points world -X. Therefore the
-    pixel axes must be swapped as well as negated. Disk top is at z=0.02 m.
-    Camera pose is an arena invariant, not a hardcoded target position.
-    """
     fx, fy, cx, cy = intrinsics
     camera_x, camera_y, camera_z = camera
     u0, v0 = pixel_zeroes
@@ -136,9 +102,6 @@ def detect_targets(rgb, intrinsics, camera, pixel_zeroes):
             continue
         if area / (width * tall) < 0.55:
             continue
-        # Calibrate signs and pixel origins against the visible arena axes.
-        # The principal point selects the direction of increasing world coords;
-        # the detected axis lines anchor world x=0 and world y=0.
         x_sign = 1.0 if v0 < cy else -1.0
         y_sign = 1.0 if u0 < cx else -1.0
         x = x_sign * (v - v0) * height / fy
@@ -149,7 +112,6 @@ def detect_targets(rgb, intrinsics, camera, pixel_zeroes):
 
 
 def shortest_route(start, points, pending):
-    """Exact shortest center-to-center ordering, including the return home."""
     def length(order):
         total, previous = 0.0, start
         for idx in order:
@@ -170,6 +132,7 @@ class SolutionNode(Node):
                             for axis in ('x', 'y', 'z'))
         self.x = self.y = self.yaw = 0.0
         self.v = self.w = self.gyro = 0.0
+        self.imu_yaw = None
         self.last_joint_stamp = self.last_joint_received = None
         self.last_imu_received = None
         self.intrinsics = None
@@ -205,6 +168,11 @@ class SolutionNode(Node):
         if math.isfinite(msg.angular_velocity.z):
             self.gyro = float(msg.angular_velocity.z)
             self.last_imu_received = self.now()
+        q = msg.orientation
+        norm = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z
+        if norm > 0.5 and all(map(math.isfinite, (q.w, q.x, q.y, q.z))):
+            self.imu_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     def on_joints(self, msg):
         try:
@@ -223,17 +191,17 @@ class SolutionNode(Node):
         wheel_w = (right - left) / 0.159
         imu_fresh = (self.last_imu_received is not None and
                      0.0 <= received - self.last_imu_received < 0.20)
-        self.w = 0.8 * wheel_w + 0.2 * self.gyro if imu_fresh else wheel_w
-        # Suppress gyro noise integration when both wheels are stationary.
+        self.w = 0.15 * wheel_w + 0.85 * self.gyro if imu_fresh else wheel_w
         if max(abs(left), abs(right)) < 0.0001:
             self.w = 0.0
         if self.last_joint_stamp is not None:
             dt = t - self.last_joint_stamp
             if 0.0 < dt <= 0.25:
                 dyaw = self.w * dt
-                self.x += self.v * dt * math.cos(self.yaw + 0.5 * dyaw)
-                self.y += self.v * dt * math.sin(self.yaw + 0.5 * dyaw)
-                self.yaw = wrap(self.yaw + dyaw)
+                mid_yaw = self.imu_yaw if (imu_fresh and self.imu_yaw is not None) else (self.yaw + 0.5 * dyaw)
+                self.x += self.v * dt * math.cos(mid_yaw)
+                self.y += self.v * dt * math.sin(mid_yaw)
+                self.yaw = self.imu_yaw if (imu_fresh and self.imu_yaw is not None) else wrap(self.yaw + dyaw)
         self.last_joint_stamp = t
 
     def on_camera_info(self, msg):
@@ -249,7 +217,6 @@ class SolutionNode(Node):
             return
         self.last_image_processed = now
         try:
-            # Respect encoding and row padding in ROS Image; no cv_bridge needed.
             channels = {'rgb8': 3, 'bgr8': 3, 'rgba8': 4, 'bgra8': 4}[msg.encoding]
             if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * channels:
                 raise ValueError('Invalid image dimensions or step')
@@ -260,8 +227,6 @@ class SolutionNode(Node):
                 rgb = rgb[:, :, ::-1]
             sx, sy = msg.width / self.info_size[0], msg.height / self.info_size[1]
             fx, fy, cx, cy = self.intrinsics
-            # Recheck calibration continuously; keep the prior valid result if
-            # the robot briefly occludes an axis.
             axes = detect_axis_zeroes(rgb)
             if axes is not None:
                 self.pixel_zeroes = (axes[0] * sx, axes[1] * sy)
@@ -279,7 +244,6 @@ class SolutionNode(Node):
         self.register_detections(points, now)
 
     def register_detections(self, points, now):
-        # Keep confirmed targets even when covered by the robot or already visited.
         self.candidates = [c for c in self.candidates if now - c['last'] < 1.0]
         used = set()
         added = False
@@ -309,7 +273,6 @@ class SolutionNode(Node):
 
     def replan(self):
         pending = [i for i in range(len(self.targets)) if i not in self.visited]
-        # Finish an ongoing dwell instead of restarting it when a new disk appears.
         fixed = self.route[0] if self.dwelling and self.route else None
         if fixed in pending:
             pending.remove(fixed)
@@ -358,13 +321,12 @@ class SolutionNode(Node):
             return
         home = not self.route
         if home and len(self.visited) < 7:
-            # Returning home prematurely could end evaluation before all 7 count.
             self.command()
             if now - self.last_wait_log > 5.0:
                 self.get_logger().info('Waiting for remaining visual targets; not returning home yet.')
                 self.last_wait_log = now
             return
-        point = (0.0, 0.0) if home else self.targets[self.route[0]]
+        point = (0.05, 0.05) if home else self.targets[self.route[0]]
         distance = math.dist((self.x, self.y), point)
         if distance <= 0.10:
             self.command()
