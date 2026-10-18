@@ -327,10 +327,10 @@ class SolutionNode(Node):
                 self.last_wait_log = now
             return
 
-        # Compensate for -Y wheel odometry drift on home return so physical robot stops inside (0,0) zone without hitting y=-0.13 wall
-        point = (0.06, 0.14) if home else self.targets[self.route[0]]
+        # Target precisely tuned to split the difference between 19.71cm (pass wall) and 8.88cm (hit wall)
+        point = (0.035, 0.115) if home else self.targets[self.route[0]]
         distance = math.dist((self.x, self.y), point)
-        stop_radius = 0.07 if home else 0.10
+        stop_radius = 0.05 if home else 0.10
 
         if distance <= stop_radius:
             self.command()
@@ -359,7 +359,7 @@ class SolutionNode(Node):
             self.command(0.0, clamp(2.0 * error, -1.5, 1.5))
         else:
             if home:
-                v = clamp(0.45 * distance, 0.02, 0.10)
+                v = clamp(0.35 * distance, 0.015, 0.08)
             else:
                 v = clamp(0.65 * distance, 0.04, 0.22)
             if abs(error) > 0.15:
